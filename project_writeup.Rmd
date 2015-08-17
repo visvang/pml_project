@@ -1,0 +1,291 @@
+---
+title: "Practical Machine Learning Course Project Writeup"
+author: "Nataliya Ivleva"
+output: html_document
+---
+
+## Data loading and preparation  
+The first step is to load the data and preprocess it for further analysis.  
+``` {r dataload, echo=TRUE, cache=TRUE}
+library(plyr)
+library(caret)
+
+if (!file.exists("train.csv")) {
+     download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "train.csv", mode = "wb")
+     }
+
+if (!file.exists("test.csv")) {
+     download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "test.csv", mode = "wb")
+     }
+
+training <- read.csv("train.csv")
+testing <- read.csv("test.csv")
+
+str(training)
+```
+  
+Firstly I'm going to modify variables so all of them are of numeric type. The warnings tell that there were NAs coerced (which is ok as it's exactly the goal of *transfactor* function).
+``` {r transformdata, echo=TRUE,cache=TRUE}
+transfactor <- function(vect) {
+     if (class(vect) == "factor") {
+          if (length(levels(vect)[1]) == 1) { 
+               vect <- mapvalues(vect, from = c(levels(vect)[1]), to = c("NA")) 
+               }
+          if ("#DIV/0!" %in% levels(vect)) {
+               vect <- mapvalues(vect, from = c("#DIV/0!"), to = c("NA"))
+               }
+          vect <- as.numeric(as.character(vect))
+          }
+     vect
+}
+
+training.upd <- lapply(training[, 8:159], transfactor)
+training.upd <- as.data.frame(training.upd)
+
+training.upd <- cbind(training[,c(160, 1:7)], training.upd)
+
+```
+There are too many variables to predict by all of them so I'm going to undertake a few steps to reduce their numbers.
+
+1. Let's remove near zero covariates as they can't help with the data variability.
+
+``` {r removeexcess, echo=TRUE, cache=TRUE}
+nsv <- nearZeroVar(training.upd, saveMetrics = TRUE)
+goodvars <- row.names(nsv[nsv$nzv == FALSE,])
+training.upd <- training.upd[, which(names(training.upd) %in% goodvars)]
+rm(nsv)
+```
+Unfortunately there are still too many variables (124 instead of 160).
+
+2. Now I'm going to hypothesize that the variables that have than 10% of observations that are not NAs can't have much contribution to the overall variance. I'm going to build a model without them and check if it's good enough. 
+
+``` {r removenas, echo=TRUE, cache=TRUE}
+valcounts <- sapply(training.upd, function (vect) {length(vect) - sum(is.na(vect))})
+valcounts <- as.data.frame(valcounts)
+valcounts$perc <- valcounts$valcounts/nrow(training.upd)
+goodvars <- row.names(valcounts[valcounts$perc > 0.1, ])
+
+training.upd <- training.upd[, which(names(training.upd) %in% goodvars)]
+
+rm(valcounts)
+rm(goodvars)
+```
+
+There are fewer variables now but I want to check if I can lessen their number still. 
+
+3. I'm going to check if some of them are correlated. As it turns out there are groups of correlated variables among the data. I'm going to pick one variable from each group and ignore the others. The full list of correlated variables and some elaborations on how I selected the exact variables to be ignored (a list in *badcorrel075*) are in **Appendix 1**.
+
+I'm also going to remove columns 2:7 with the data-related information (e.g. time and user name). The idea is that if I want to build a model to predict the manner in which one performs the excecise based on the data from personal activity recording devices I don't want to rely on specific circumstantial data. The knowledge that for example user A tends to perform excercises in manner C won't help in case of predicting the manner for absolutely different user, I presume.
+
+``` {r findcorrels, echo=TRUE, cache=TRUE}
+correl <- abs(cor(training.upd[, -(1:7)]))
+diag(correl) <- 0
+correlvars <- which(correl >= 0.75, arr.ind = TRUE)
+
+badcorrel075 <- c("yaw_belt", "total_accel_belt", "accel_belt_y", "accel_belt_z", "accel_arm_y", "accel_belt_x", "magnet_belt_x", "magnet_dumbbell_y", "magnet_belt_z", "gyros_arm_y", "magnet_arm_z", "accel_arm_x", "magnet_arm_y", "accel_arm_z", "accel_dumbbell_x", "accel_dumbbell_z", "accel_dumbbell_y", "gyros_forearm_z", "gyros_dumbbell_x", "gyros_dumbbell_z", "gyros_forearm_y", "magnet_dumbbell_y", "accel_forearm_y")
+training.upd <- training.upd[, -which(names(training.upd) %in% badcorrel075)]
+
+training.upd <- training.upd[, -(2:7)]
+
+rm(training) # remove excess variables to free memory
+rm(correl)
+rm(correlvars)
+
+str(training.upd)
+```
+  
+## Split into training and test set
+
+As there is only a small test set provided that can't be used as the real test set for my model I'm going to split the provided training set into training and test set. First to save my computer's resources I'm going to have rather small training set and evaluate the model built on half the data. 
+So the plan is:
+1. Set aside 50% of training set for final quality test
+2. Split the rest into 5 folds (5 folds are also the compromise for the sake of computational resources).
+
+``` {r splitdata, echo=TRUE, cache=TRUE}
+set.seed(11111)
+inTrain <- createDataPartition(y = training.upd$classe, p = 0.5, list = FALSE)
+mytrain <- training.upd [inTrain, ]
+mytest <- training.upd[-inTrain, ]
+
+set.seed(22222)
+folds <- createFolds(y = mytrain$classe, k = 5, list = TRUE, returnTrain = FALSE)
+
+rm(inTrain)
+rm(training.upd) # remove to free memory
+```
+
+## Train the model, make predictions and estimate the error
+
+The model I'm going to use is random forest on all the variables left after data preparation. I've also tried tree predictions and principal component analysis before applying random forest model but the accuracy was lower. 
+
+I'm going to load the trained models for each fold from cache (see the code for models in **Appendix 2**).
+
+``` {r applymodels, echo=TRUE, cache=TRUE}
+accur <- NULL
+
+modRF1 <- readRDS("modRF1.rds")
+pred <- predict(modRF1, mytrain[folds[[1]], ])
+cm1 <- confusionMatrix(pred, mytrain[folds[[1]], 1])
+accur <- c(accur, cm1$overall[1])
+
+modRF2 <- readRDS("modRF2.rds")
+pred <- predict(modRF2, mytrain[folds[[2]], ])
+cm1 <- confusionMatrix(pred, mytrain[folds[[2]], 1])
+accur <- c(accur, cm1$overall[1])
+
+modRF3 <- readRDS("modRF3.rds")
+pred <- predict(modRF3, mytrain[folds[[3]], ])
+cm1 <- confusionMatrix(pred, mytrain[folds[[3]], 1])
+accur <- c(accur, cm1$overall[1])
+
+modRF4 <- readRDS("modRF4.rds")
+pred <- predict(modRF4, mytrain[folds[[4]], ])
+cm1 <- confusionMatrix(pred, mytrain[folds[[4]], 1])
+accur <- c(accur, cm1$overall[1])
+
+modRF5 <- readRDS("modRF5.rds")
+pred <- predict(modRF5, mytrain[folds[[5]], ])
+cm1 <- confusionMatrix(pred, mytrain[folds[[5]], 1])
+accur <- c(accur, cm1$overall[1])
+```
+
+What's the accuracy for each fold and the average accuracy?
+``` {r checkaccur, echo=TRUE}
+accur
+sum(accur)/length(accur)
+```
+The average accuracy is 98,5% that I assume being fairly good.
+I think that the selected variables and model are good to make predictions. I'm going to use the model, trained on the first fold as my working model (*modRF1*). 
+
+The first thing I want is to compare the average accuracy on training set with the out of sample accuracy (the accuracy of predictions made on the other half of initial training data).
+
+```{r checktest, echo=TRUE}
+pred <- predict(modRF1, mytest)
+cm1 <- confusionMatrix(pred, mytest$classe)
+cm1$overall[1]
+cm1$overall[3:4]
+```
+The accuracy on my test set is 98.3% which is slightly worse than the accuracy on my training set but not greatly. In fact the average accuracy on training set is in 95% confidence interval for accuracy on test set.  
+
+I'm going to use this exact trained model on the provided test set.
+
+## Appendix 1
+
+The list of correlated variables with correlation >= 0.75 (I chose 0.75 instead of 0.8 because 0.8 threshold allowed too few variables to be ignored) was stored in *correlvars* variable and if grouped looks like following.
+The reasons to select one from each group and ignore the others are roughly these:  
+-- if one variable correlates with most others in the group it's selected (e.g. if 1 correlates with 3, 4, 9, 10 and 22, but 22 correlates only with 1, 4 and 10, I'm going to select 1);  
+-- if there are variables representing particular dimension and "general" variables (e.g. *total_accel_dumbbell* and *accel_dumbbell_y*), I'm going to prefer "general" variable;  
+-- if there are a few correlated variables with the same name representing several dimensions (e.g. *accel_belt_x*, *accel_belt_y* and *accel_belt_z*) I'm going to prefer x over y and y over z.  
+
+These rules are rather arbitrary and not strictly applied, just an idea how to deal with correlated variables.
+
+**The list of correlated variables**  
+*variable*          *row* *col*  
+yaw_belt               3   1  
+total_accel_belt       4   1  
+accel_belt_y           9   1  
+accel_belt_z          10   1  
+accel_arm_y           22   1  
+roll_belt              1   3  
+total_accel_belt       4   3  
+accel_belt_z          10   3  
+roll_belt              1   4  
+yaw_belt               3   4  
+accel_belt_y           9   4  
+accel_belt_z          10   4  
+accel_arm_y           22   4  
+roll_belt              1   9  
+total_accel_belt       4   9  
+accel_belt_z          10   9  
+roll_belt              1  10  
+yaw_belt               3  10  
+total_accel_belt       4  10  
+accel_belt_y           9  10  
+accel_arm_y           22  10  
+roll_belt              1  22  
+total_accel_belt       4  22  
+accel_belt_z          10  22  
+  
+accel_belt_x           8   2  
+magnet_belt_x         11   2  
+pitch_belt             2   8  
+magnet_belt_x         11   8  
+pitch_belt             2  11  
+accel_belt_x           8  11  
+  
+magnet_dumbbell_y     38   5  
+gyros_belt_x           5  38  
+  
+magnet_belt_z         13  12  
+magnet_belt_y         12  13  
+  
+gyros_arm_y           19  18  
+gyros_arm_x           18  19  
+  
+magnet_arm_x          24  21  
+magnet_arm_z          26  23  
+accel_arm_x           21  24  
+magnet_arm_y          25  24  
+magnet_arm_x          24  25  
+magnet_arm_z          26  25  
+accel_arm_z           23  26  
+magnet_arm_y          25  26  
+  
+accel_dumbbell_x      34  28  
+pitch_dumbbell        28  34  
+  
+accel_dumbbell_z      36  29  
+yaw_dumbbell          29  36  
+  
+accel_dumbbell_y      35  30  
+total_accel_dumbbell  30  35  
+  
+gyros_dumbbell_z      33  31  
+gyros_forearm_z       46  31  
+gyros_dumbbell_x      31  33  
+gyros_forearm_z       46  33  
+gyros_forearm_z       46  45  
+gyros_dumbbell_x      31  46  
+gyros_dumbbell_z      33  46  
+gyros_forearm_y       45  46  
+  
+magnet_dumbbell_y     38  37  
+magnet_dumbbell_x     37  38  
+  
+magnet_forearm_y      51  48  
+accel_forearm_y       48  51  
+  
+
+## Appendix 2  
+How I trained the models for each fold:  
+
+``` {r trainrf, echo=TRUE, eval=FALSE}
+
+f <- folds[[1]]
+train1 <- mytrain[-f,]
+modRF1 <- train(classe ~ ., method = "rf", data = train1)
+saveRDS(modRF1, file = "modRF1.rds")
+
+f <- folds[[2]]
+train1 <- mytrain[-f, ]
+modRF2 <- train(classe ~ ., method = "rf", data = train1)
+saveRDS(modRF2, file = "modRF2.rds")
+
+f <- folds[[3]]
+train1 <- mytrain[-f, ]
+modRF3 <- train(classe ~ ., method = "rf", data = train1)
+saveRDS(modRF3, file = "modRF3.rds")
+
+f <- folds[[4]]
+train1 <- mytrain[-f, ]
+modRF4 <- train(classe ~., method = "rf", data = train1)
+saveRDS(modRF4, file = "modRF4.rds")
+
+f <- folds[[5]]
+train1 <- mytrain[-f, ]
+modRF5 <- train(classe~., method = "rf", data = train1)
+saveRDS(modRF5, file = "modRF5.rds")
+```
+  
+**Footnote**:  
+I know that the way I trained my model over the folds is by no means elegant. I saved all the trained models for research purposes and didn't want to retrain them while compiling the .html file. 
